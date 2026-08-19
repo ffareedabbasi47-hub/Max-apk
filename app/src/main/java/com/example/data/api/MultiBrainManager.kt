@@ -1,0 +1,409 @@
+package com.example.data.api
+
+import android.content.Context
+import com.example.BuildConfig
+import com.example.data.api.providers.*
+import com.example.data.model.ActionType
+import com.example.data.model.ParsedMaxAction
+import com.example.system.MaxAccessibilityService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.OkHttpClient
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import com.example.data.api.diagnostics.GeminiDiagnosticResult
+import com.example.data.api.diagnostics.GeminiDiagnosticService
+import com.example.data.security.SecureKeyStore
+import java.util.concurrent.TimeUnit
+
+class MultiBrainManager(private val context: Context) {
+
+    // SECURITY FIX: previously plain SharedPreferences("max_jarvis_prefs").
+    // All API keys now live in SecureKeyStore (Android Keystore-backed
+    // EncryptedSharedPreferences) — see data/security/SecureKeyStore.kt.
+    // Non-key settings, if this class ever grows any, should keep using
+    // plain SharedPreferences; only key lookups go through SecureKeyStore.
+
+    // BUGFIX (provider fallback efficiency): 30s connect + 30s read meant a
+    // single hung Gemini call could take up to ~60s, and with 3 fallback
+    // model IDs tried in sequence, a bad network could block the user for
+    // ~3 minutes before MAX ever reached OpenAI/Claude/local fallback.
+    // Tightened to values appropriate for a voice assistant (user is
+    // actively waiting), with an explicit overall callTimeout as a hard
+    // ceiling regardless of where time is spent.
+    private val client = OkHttpClient.Builder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(12, TimeUnit.SECONDS)
+        .writeTimeout(8, TimeUnit.SECONDS)
+        .callTimeout(15, TimeUnit.SECONDS)
+        .build()
+
+    private val geminiProvider = GeminiProvider(client)
+    private val openAIProvider = OpenAIProvider(client)
+    private val claudeProvider = ClaudeProvider(client)
+    private val localLLMManager = com.example.system.LocalLLMManager(context)
+    private val localLLMProvider = LocalLLMProvider(localLLMManager)
+    private val diagnosticService = GeminiDiagnosticService(client)
+
+    fun isOnline(): Boolean {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    fun getLocalLLMManager(): com.example.system.LocalLLMManager = localLLMManager
+
+    suspend fun runGeminiDiagnostic(apiKey: String = BuildConfig.GEMINI_API_KEY): GeminiDiagnosticResult {
+        return diagnosticService.testGeminiConnectivity(apiKey)
+    }
+
+    // PHASE 10 — real screen vision. Tries every configured Gemini key in
+    // turn (same rotation as text chat) until one succeeds. Returns null,
+    // never a made-up description, if none work or no key is configured --
+    // the caller (ViewModel) is responsible for reporting that honestly.
+    suspend fun analyzeImage(instruction: String, imageBase64: String): String? {
+        for (key in getGeminiApiKeys()) {
+            val result = geminiProvider.generateVisionResponse(instruction, imageBase64, key)
+            if (!result.isNullOrBlank()) return result
+        }
+        return null
+    }
+
+    // Short-term conversation history for context awareness
+    private val recentContextHistory = mutableListOf<String>()
+
+    private val systemPrompt: String
+        get() = """
+        You are "MAX", a highly intelligent, witty, loyal personal AI assistant and best friend to the user.
+        You treat the user as "Boss". You speak naturally in Hinglish (a mix of Hindi and English) or English as appropriate.
+        You can answer general questions (science, history, date/time, math, technology, sports) and also control device actions.
+        
+        Current Device Time: ${SimpleDateFormat("EEEE, dd MMMM yyyy HH:mm", Locale.getDefault()).format(Date())}
+
+        When responding:
+        - Call the user "Boss" naturally (do not repeat it in every single phrase).
+        - Keep answers concise, clear, and direct (2-4 sentences max for easy speech).
+        - Answer general knowledge and conversation questions accurately.
+        
+        If a device action is requested, prepend one of these action tags:
+        - Open App -> [ACTION:OPEN_APP|target_app_name]
+        - System Toggle -> [ACTION:TOGGLE|setting_name|on/off/toggle]
+        - WhatsApp -> [ACTION:WHATSAPP|recipient|message]
+        - Email -> [ACTION:EMAIL|recipient|subject_and_body]
+        - Call -> [ACTION:CALL|contact_name_or_number]
+        - File Creation -> [ACTION:FILE|filename|content]
+        - File Edit -> [ACTION:FILE_EDIT|filename|new_content]
+        - File Delete -> [ACTION:FILE_DELETE|filename]
+        - File Find -> [ACTION:FILE_FIND|search_term]
+        - Web Search -> [ACTION:SEARCH|query]
+        - Screen Vision -> [ACTION:SCREEN_VISION|instruction]
+        - Start Screen Share -> [ACTION:SCREEN_SHARE_START]
+        - Stop Screen Share -> [ACTION:SCREEN_SHARE_STOP]
+        - Diagnostic -> [ACTION:DIAGNOSTIC]
+        - Flashlight -> [ACTION:FLASHLIGHT]
+        - Volume -> [ACTION:VOLUME|0-100]
+        - Copy to clipboard -> [ACTION:CLIPBOARD|text_to_copy]
+        - Screenshot -> [ACTION:SCREENSHOT]
+        - Read recent notifications -> [ACTION:NOTIFICATIONS]
+        
+        Example: "[ACTION:OPEN_APP|YouTube] Bilkul Boss! YouTube open kar raha hoon."
+    """.trimIndent()
+
+    fun getCustomApiKey(): String {
+        return SecureKeyStore.getString(context, "custom_gemini_api_key")
+    }
+
+    suspend fun processUserPrompt(prompt: String): ParsedMaxAction = withContext(Dispatchers.IO) {
+
+        val trimmedPrompt = prompt.trim()
+        val contextualPrompt = if (recentContextHistory.isNotEmpty()) {
+            "Previous Context:\n${recentContextHistory.takeLast(4).joinToString("\n")}\n\nUser Question: $trimmedPrompt"
+        } else {
+            trimmedPrompt
+        }
+
+        // Priority 0: if there's no internet at all but a local model is ready,
+        // go straight to it instead of wasting time on network calls that will
+        // just time out.
+        if (!isOnline() && localLLMProvider.isConfigured()) {
+            val offlineText = localLLMProvider.generateResponse(contextualPrompt, systemPrompt, "")
+            if (!offlineText.isNullOrBlank()) {
+                recordHistory(trimmedPrompt, offlineText)
+                return@withContext parseMaxResponse(offlineText, prompt)
+            }
+        }
+
+        // Priority 1: Gemini Provider across configured keys
+        val geminiKeys = getGeminiApiKeys()
+        for (key in geminiKeys) {
+            val responseText = geminiProvider.generateResponse(contextualPrompt, systemPrompt, key)
+            if (!responseText.isNullOrBlank()) {
+                recordHistory(trimmedPrompt, responseText)
+                return@withContext parseMaxResponse(responseText, prompt)
+            }
+        }
+
+        // Priority 2: OpenAI Provider
+        val openAIKey = SecureKeyStore.getString(context, "openai_api_key")
+        if (openAIKey.isNotBlank()) {
+            val responseText = openAIProvider.generateResponse(contextualPrompt, systemPrompt, openAIKey)
+            if (!responseText.isNullOrBlank()) {
+                recordHistory(trimmedPrompt, responseText)
+                return@withContext parseMaxResponse(responseText, prompt)
+            }
+        }
+
+        // Priority 3: Claude Provider
+        val claudeKey = SecureKeyStore.getString(context, "claude_api_key")
+        if (claudeKey.isNotBlank()) {
+            val responseText = claudeProvider.generateResponse(contextualPrompt, systemPrompt, claudeKey)
+            if (!responseText.isNullOrBlank()) {
+                recordHistory(trimmedPrompt, responseText)
+                return@withContext parseMaxResponse(responseText, prompt)
+            }
+        }
+
+        // Priority 3.5: all cloud providers failed (bad keys, quota, or the
+        // network dropped mid-conversation) — try the local model as a safety
+        // net before falling back to canned pattern-matching.
+        if (localLLMProvider.isConfigured()) {
+            val offlineText = localLLMProvider.generateResponse(contextualPrompt, systemPrompt, "")
+            if (!offlineText.isNullOrBlank()) {
+                recordHistory(trimmedPrompt, offlineText)
+                return@withContext parseMaxResponse(offlineText, prompt)
+            }
+        }
+
+        // Priority 4: Smart Local Fallback Router
+        // BUGFIX: previously this only ever told the user to "configure an API key",
+        // even when a key WAS configured but every provider call failed (bad key,
+        // network issue, quota, wrong model). That was misleading — distinguish the
+        // two cases so the user knows what's actually wrong.
+        val hasAnyKey = geminiKeys.isNotEmpty() ||
+            SecureKeyStore.contains(context, "openai_api_key") ||
+            SecureKeyStore.contains(context, "claude_api_key") ||
+            localLLMProvider.isConfigured()
+        val fallback = parseLocalFallback(prompt, missingKey = !hasAnyKey)
+        val finalFallback = if (hasAnyKey) {
+            fallback.copy(
+                speechResponse = fallback.speechResponse +
+                    " (Note: AI providers didn't respond — check Logcat/API key validity, Boss.)"
+            )
+        } else {
+            fallback
+        }
+        recordHistory(trimmedPrompt, finalFallback.speechResponse)
+        return@withContext finalFallback
+    }
+
+    private fun recordHistory(userQuery: String, maxReply: String) {
+        synchronized(recentContextHistory) {
+            recentContextHistory.add("User: $userQuery")
+            recentContextHistory.add("MAX: $maxReply")
+            if (recentContextHistory.size > 10) {
+                recentContextHistory.removeAt(0)
+                recentContextHistory.removeAt(0)
+            }
+        }
+    }
+
+    private fun getGeminiApiKeys(): List<String> {
+        val keys = mutableListOf<String>()
+        val customKey1 = SecureKeyStore.getString(context, "api_key_slot_1")
+        val customKey2 = SecureKeyStore.getString(context, "api_key_slot_2")
+        val customKey3 = SecureKeyStore.getString(context, "api_key_slot_3")
+        val customGeminiKey = SecureKeyStore.getString(context, "custom_gemini_api_key")
+
+        if (customKey1.isNotBlank()) keys.add(customKey1.trim())
+        if (customKey2.isNotBlank()) keys.add(customKey2.trim())
+        if (customKey3.isNotBlank()) keys.add(customKey3.trim())
+        if (customGeminiKey.isNotBlank()) keys.add(customGeminiKey.trim())
+
+        val buildKey = BuildConfig.GEMINI_API_KEY.trim()
+        if (buildKey.isNotBlank() && buildKey != "MY_GEMINI_API_KEY") {
+            keys.add(buildKey)
+        }
+        return keys.distinct()
+    }
+
+    private fun parseMaxResponse(rawText: String, prompt: String): ParsedMaxAction {
+        val actionRegex = Regex("\\[ACTION:([A-Z_]+)(?:\\|([^|\\]]*))?(?:\\|([^|\\]]*))?\\]")
+        val match = actionRegex.find(rawText)
+
+        if (match != null) {
+            val typeStr = match.groupValues[1]
+            val param1 = match.groupValues.getOrNull(2) ?: ""
+            val param2 = match.groupValues.getOrNull(3) ?: ""
+            val cleanSpeech = rawText.replace(match.value, "").trim()
+
+            val actionType = when (typeStr) {
+                "OPEN_APP" -> ActionType.OPEN_APP
+                "TOGGLE" -> ActionType.TOGGLE_SETTINGS
+                "WHATSAPP" -> ActionType.SEND_WHATSAPP
+                "EMAIL" -> ActionType.DRAFT_EMAIL
+                "CALL" -> ActionType.MAKE_CALL
+                "FILE" -> ActionType.CREATE_FILE
+                "FILE_EDIT" -> ActionType.EDIT_FILE
+                "FILE_DELETE" -> ActionType.DELETE_FILE
+                "FILE_FIND" -> ActionType.FIND_FILE
+                "SEARCH" -> ActionType.WEB_SEARCH
+                "SCREEN_VISION" -> ActionType.ANALYZE_SCREEN_VISUAL
+                "SCREEN_SHARE_START" -> ActionType.SHARE_SCREEN_START
+                "SCREEN_SHARE_STOP" -> ActionType.SHARE_SCREEN_STOP
+                "DIAGNOSTIC" -> ActionType.SYSTEM_DIAGNOSTIC
+                "FLASHLIGHT" -> ActionType.FLASHLIGHT
+                "VOLUME" -> ActionType.VOLUME
+                "CLIPBOARD" -> ActionType.CLIPBOARD
+                "SCREENSHOT" -> ActionType.SCREENSHOT
+                "NOTIFICATIONS" -> ActionType.READ_NOTIFICATIONS
+                else -> ActionType.GENERAL_TALK
+            }
+
+            return ParsedMaxAction(
+                actionType = actionType,
+                target = param1,
+                details = param2,
+                speechResponse = cleanSpeech.ifEmpty { "Haan Boss, kaam ho gaya!" },
+                isFallback = false
+            )
+        }
+
+        return ParsedMaxAction(
+            actionType = ActionType.GENERAL_TALK,
+            speechResponse = rawText,
+            isFallback = false
+        )
+    }
+
+    private fun parseLocalFallback(prompt: String, missingKey: Boolean): ParsedMaxAction {
+        val lower = prompt.lowercase(Locale.getDefault())
+
+        val dateStr = SimpleDateFormat("EEEE, dd MMMM yyyy", Locale.getDefault()).format(Date())
+        val timeStr = SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date())
+
+        val baseAction = when {
+            // General Date & Time queries
+            lower.contains("date") || lower.contains("tareekh") || lower.contains("din") -> {
+                ParsedMaxAction(
+                    actionType = ActionType.GENERAL_TALK,
+                    speechResponse = "Aaj $dateStr hai, Boss."
+                )
+            }
+            lower.contains("time") || lower.contains("samay") || lower.contains("waqt") || lower.contains("baja") -> {
+                ParsedMaxAction(
+                    actionType = ActionType.GENERAL_TALK,
+                    speechResponse = "Abhi time $timeStr ho raha hai, Boss."
+                )
+            }
+            // Capital & Knowledge queries
+            lower.contains("capital of india") || lower.contains("india ki capital") -> {
+                ParsedMaxAction(
+                    actionType = ActionType.GENERAL_TALK,
+                    speechResponse = "India ki capital New Delhi hai, Boss."
+                )
+            }
+            lower.contains("gravity") -> {
+                ParsedMaxAction(
+                    actionType = ActionType.GENERAL_TALK,
+                    speechResponse = "Gravity ek natural force hai jo mass wali cheezon ko ek doosre ki taraf khinchti hai. Earth par iski acceleration 9.8 m/s² hai, Boss."
+                )
+            }
+            // Device actions
+            lower.contains("open") || lower.contains("khol") || lower.contains("launch") -> {
+                // BUGFIX: the old regex stripped "app" as a bare substring
+                // anywhere in the text — so "WhatsApp kholo" became "Whats"
+                // because "app" was removed from the MIDDLE of "WhatsApp"
+                // too. Word boundaries (\b) now ensure only whole standalone
+                // words like "open"/"app" get stripped, not substrings
+                // inside app names.
+                val appName = prompt.replace(Regex("(?i)\\b(open|launch|khol|kholo|app|max)\\b"), "").trim()
+                ParsedMaxAction(
+                    actionType = ActionType.OPEN_APP,
+                    target = appName.ifEmpty { "Settings" },
+                    speechResponse = "Bilkul Boss! Main abhi ${appName.ifEmpty { "app" }} open kar raha hoon."
+                )
+            }
+            lower.contains("wifi") || lower.contains("wi-fi") || lower.contains("bluetooth") || lower.contains("silent") || lower.contains("mute") || lower.contains("flashlight") || lower.contains("torch") -> {
+                val targetSetting = when {
+                    lower.contains("wifi") || lower.contains("wi-fi") -> "Wi-Fi"
+                    lower.contains("bluetooth") -> "Bluetooth"
+                    lower.contains("flashlight") || lower.contains("torch") -> "Flashlight"
+                    else -> "Silent Mode"
+                }
+                ParsedMaxAction(
+                    actionType = ActionType.TOGGLE_SETTINGS,
+                    target = targetSetting,
+                    speechResponse = "Ji Boss, $targetSetting control settings update kar di hain."
+                )
+            }
+            lower.contains("whatsapp") || lower.contains("chat") || lower.contains("message") -> {
+                ParsedMaxAction(
+                    actionType = ActionType.SEND_WHATSAPP,
+                    target = "Contact",
+                    details = prompt,
+                    speechResponse = "Haan Boss! WhatsApp message draft kar diya hai."
+                )
+            }
+            lower.contains("call") || lower.contains("dial") -> {
+                val targetName = prompt.replace(Regex("(?i)call|dial|phone|max"), "").trim()
+                ParsedMaxAction(
+                    actionType = ActionType.MAKE_CALL,
+                    target = targetName.ifEmpty { "Contact" },
+                    speechResponse = "Ji Boss! ${targetName.ifEmpty { "Contact" }} ko call laga raha hoon."
+                )
+            }
+            lower.contains("status") || lower.contains("diagnostic") || lower.contains("check") -> {
+                ParsedMaxAction(
+                    actionType = ActionType.SYSTEM_DIAGNOSTIC,
+                    speechResponse = "Systems fully operational, Boss! MAX Core running smooth."
+                )
+            }
+            lower.contains("flashlight") || lower.contains("torch") -> {
+                ParsedMaxAction(
+                    actionType = ActionType.FLASHLIGHT,
+                    speechResponse = "Flashlight toggled, Boss."
+                )
+            }
+            lower.contains("volume") -> {
+                val num = Regex("\\d+").find(lower)?.value ?: "50"
+                ParsedMaxAction(
+                    actionType = ActionType.VOLUME,
+                    target = num,
+                    speechResponse = "Volume set to $num%, Boss."
+                )
+            }
+            lower.contains("screenshot") -> {
+                ParsedMaxAction(
+                    actionType = ActionType.SCREENSHOT,
+                    speechResponse = "Taking a screenshot, Boss."
+                )
+            }
+            lower.contains("notification") -> {
+                ParsedMaxAction(
+                    actionType = ActionType.READ_NOTIFICATIONS,
+                    speechResponse = "Checking recent notifications, Boss."
+                )
+            }
+            lower.contains("copy") -> {
+                val toCopy = prompt.replace(Regex("(?i)copy|max"), "").trim()
+                ParsedMaxAction(
+                    actionType = ActionType.CLIPBOARD,
+                    target = toCopy,
+                    speechResponse = "Copied to clipboard, Boss."
+                )
+            }
+            else -> {
+                val notice = if (missingKey) " (Tip: Configure API Key in Settings for live AI answers)" else ""
+                ParsedMaxAction(
+                    actionType = ActionType.GENERAL_TALK,
+                    speechResponse = "Haan Boss! Main aapki baat samajh gaya. Kya command hai?$notice"
+                )
+            }
+        }
+
+        return baseAction.copy(isFallback = true)
+    }
+}
+
